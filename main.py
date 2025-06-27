@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import logging
+import base64
+import requests
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -14,7 +16,10 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "123456"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
-DB_PATH = os.getenv("DB_PATH", "jobs.db")
+DB_PATH = os.getenv("DB_PATH", "/app/data/jobs.db")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GITHUB_REPO = os.getenv("GITHUB_REPO")  # Например, "username/telegram-bot-data"
+GITHUB_PATH = os.getenv("GITHUB_PATH", "jobs.db")  # Путь к файлу в репозитории
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -23,6 +28,25 @@ user_states = {}
 user_edit_states = {}
 
 def init_db():
+    # Создаем директорию для базы данных
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    
+    # Скачиваем базу данных с GitHub, если она не существует локально
+    if not os.path.exists(DB_PATH) and GITHUB_TOKEN and GITHUB_REPO:
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+            headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3.raw"}
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                with open(DB_PATH, "wb") as f:
+                    f.write(base64.b64decode(response.json()["content"]))
+                logger.info("База данных восстановлена с GitHub")
+            else:
+                logger.warning("База данных не найдена на GitHub, создается новая")
+        except Exception as e:
+            logger.error(f"Ошибка восстановления базы данных: {e}")
+
+    # Инициализируем базу данных
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute('''
@@ -43,6 +67,33 @@ def init_db():
             )
         ''')
         conn.commit()
+
+def backup_db():
+    # Загружаем базу данных на GitHub
+    if GITHUB_TOKEN and GITHUB_REPO and os.path.exists(DB_PATH):
+        try:
+            with open(DB_PATH, "rb") as f:
+                content = base64.b64encode(f.read()).decode("utf-8")
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_PATH}"
+            headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
+            # Проверяем, существует ли файл
+            response = requests.get(url, headers=headers)
+            sha = response.json().get("sha") if response.status_code == 200 else None
+            # Обновляем или создаем файл
+            data = {
+                "message": "Update jobs.db",
+                "content": content,
+                "branch": "main"
+            }
+            if sha:
+                data["sha"] = sha
+            response = requests.put(url, headers=headers, json=data)
+            if response.status_code in [200, 201]:
+                logger.info("База данных сохранена на GitHub")
+            else:
+                logger.error(f"Ошибка сохранения базы данных: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Ошибка при резервном копировании: {e}")
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
@@ -66,6 +117,7 @@ async def employer_start(message: Message):
                 (message.from_user.id, "employer", employer_code)
             )
             conn.commit()
+            backup_db()
         else:
             employer_code = user[2]
 
@@ -119,6 +171,9 @@ async def my_vacancies(message: Message):
         for vid, desc in rows:
             short_desc = desc if len(desc) <= 30 else desc[:27] + "..."
             kb.button(text=f"{vid}: {short_desc}")
+            kb.button(text=f"Изменить {vid}")
+            kb.button(text=f"Удалить {vid}")
+        kb.adjust(1)
         await message.answer("Ваши вакансии:", reply_markup=kb.as_markup(resize_keyboard=True))
 
 @dp.message(F.text.regexp(r"^Удалить \d+$"))
@@ -126,16 +181,32 @@ async def delete_vacancy(message: Message):
     vid = int(message.text.split()[1])
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        cur.execute("DELETE FROM vacancies WHERE id = ?", (vid,))
+        cur.execute("SELECT employer_code FROM users WHERE telegram_id = ?", (message.from_user.id,))
+        user = cur.fetchone()
+        if not user:
+            return await message.answer("Ошибка. Вы не работодатель.")
+        employer_code = user[0]
+        cur.execute("DELETE FROM vacancies WHERE id = ? AND employer_code = ?", (vid, employer_code))
         if cur.rowcount:
             conn.commit()
+            backup_db()
             await message.answer(f"Вакансия #{vid} удалена.")
         else:
-            await message.answer("Не найдена или не ваша.")
+            await message.answer("Вакансия не найдена или не принадлежит вам.")
 
 @dp.message(F.text.regexp(r"^Изменить \d+$"))
 async def start_edit(message: Message):
     vid = int(message.text.split()[1])
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT employer_code FROM users WHERE telegram_id = ?", (message.from_user.id,))
+        user = cur.fetchone()
+        if not user:
+            return await message.answer("Ошибка. Вы не работодатель.")
+        employer_code = user[0]
+        cur.execute("SELECT id FROM vacancies WHERE id = ? AND employer_code = ?", (vid, employer_code))
+        if not cur.fetchone():
+            return await message.answer("Вакансия не найдена или не принадлежит вам.")
     user_edit_states[message.from_user.id] = vid
     await message.answer(f"Введите новое описание для вакансии #{vid}:")
 
@@ -149,7 +220,13 @@ async def subscription_status(message: Message):
             return await message.answer("Подписка не активна.")
         start = datetime.strptime(row[0], "%Y-%m-%d")
         days_left = 30 - (datetime.now() - start).days
-        await message.answer(f"Осталось дней подписки: {days_left}")
+        if days_left < 0:
+            cur.execute("UPDATE users SET subscription_active = 0, subscription_start = NULL WHERE telegram_id = ?", (message.from_user.id,))
+            conn.commit()
+            backup_db()
+            await message.answer("Подписка истекла.")
+        else:
+            await message.answer(f"Осталось дней подписки: {days_left}")
 
 @dp.message(F.text == "Ищу работу")
 async def search_job(message: Message):
@@ -164,7 +241,16 @@ async def admin_panel(message: Message):
     kb.button(text="/vacancies")
     kb.button(text="/sql SELECT * FROM users")
     kb.button(text="/sql SELECT * FROM vacancies")
+    kb.button(text="/confirm_subscription")
+    kb.adjust(1)
     await message.answer("🔧 Админ-панель активна:", reply_markup=kb.as_markup(resize_keyboard=True))
+
+@dp.message(F.text == "/confirm_subscription")
+async def confirm_subscription_start(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return await message.answer("Нет доступа.")
+    user_states[message.from_user.id] = {"step": "confirm_subscription"}
+    await message.answer("Введите Telegram ID или employer_code пользователя для подтверждения подписки:")
 
 @dp.message(F.text.startswith("/sql "))
 async def sql_command(message: Message):
@@ -183,6 +269,7 @@ async def sql_command(message: Message):
                 await message.answer(f"<pre>{result}</pre>", parse_mode="HTML")
             else:
                 conn.commit()
+                backup_db()
                 await message.answer("✅ Готово.")
     except Exception as e:
         await message.answer(f"Ошибка: {e}")
@@ -211,6 +298,7 @@ async def handle_input(message: Message):
             cur = conn.cursor()
             cur.execute("UPDATE vacancies SET description = ? WHERE id = ?", (message.text.strip(), vid))
             conn.commit()
+            backup_db()
         return await message.answer("Описание обновлено.")
     if uid in user_states:
         state = user_states[uid]
@@ -227,6 +315,7 @@ async def handle_input(message: Message):
                     return await message.answer("Ошибка. Вы не работодатель.")
                 cur.execute("INSERT INTO vacancies (employer_code, city, description) VALUES (?, ?, ?)", (row[0], state["city"], message.text.strip()))
                 conn.commit()
+                backup_db()
             user_states.pop(uid)
             return await message.answer("Вакансия добавлена.")
         elif state.get("step") == "worker_city":
@@ -241,6 +330,39 @@ async def handle_input(message: Message):
                 result += f"#{row[0]} | {row[1]}: {row[2][:50]}...\n"
             user_states.pop(uid)
             return await message.answer(result)
+        elif state.get("step") == "confirm_subscription":
+            input_text = message.text.strip()
+            with sqlite3.connect(DB_PATH) as conn:
+                cur = conn.cursor()
+                if input_text.isdigit():
+                    cur.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (int(input_text),))
+                else:
+                    cur.execute("SELECT telegram_id FROM users WHERE employer_code = ?", (input_text,))
+                row = cur.fetchone()
+                if not row:
+                    user_states.pop(uid)
+                    return await message.answer("Пользователь не найден.")
+                telegram_id = row[0]
+                cur.execute(
+                    "UPDATE users SET subscription_active = 1, subscription_start = ? WHERE telegram_id = ?",
+                    (datetime.now().strftime("%Y-%m-%d"), telegram_id)
+                )
+                conn.commit()
+                backup_db()
+            user_states.pop(uid)
+            await message.answer(f"Подписка для пользователя (ID: {telegram_id}) подтверждена.")
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    "✅ Ваша подписка подтверждена! Теперь вы можете размещать вакансии.",
+                    reply_markup=ReplyKeyboardBuilder()
+                        .button(text="Разместить вакансию")
+                        .button(text="Мои вакансии")
+                        .button(text="Подписка")
+                        .as_markup(resize_keyboard=True)
+                )
+            except Exception as e:
+                await message.answer(f"Не удалось уведомить пользователя: {e}")
     else:
         await message.answer("Напиши /start")
 
