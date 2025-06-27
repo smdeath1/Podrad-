@@ -154,9 +154,7 @@ async def check_payment(message: Message):
                 if datetime.now() - start_date <= timedelta(days=30):
                     kb = ReplyKeyboardBuilder()
                     kb.button(text="Разместить вакансию")
-                    kb
-
-                    .button(text="Мои вакансии")
+                    kb.button(text="Мои вакансии")
                     kb.button(text="Подписка")
                     await message.answer("✅ Подписка подтверждена. Добро пожаловать!", reply_markup=kb.as_markup(resize_keyboard=True))
                     return
