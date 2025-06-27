@@ -209,8 +209,7 @@ async def delete_vacancy(message: Message):
             if not user:
                 return await message.answer("Ошибка. Вы не работодатель.")
             employer_code = user[0]
-            cur.execute(" DEL
-ETE FROM vacancies WHERE id = ? AND employer_code = ?", (vid, employer_code))
+            cur.execute(" DELETE FROM vacancies WHERE id = ? AND employer_code = ?", (vid, employer_code))
             if cur.rowcount:
                 conn.commit()
                 backup_db()
